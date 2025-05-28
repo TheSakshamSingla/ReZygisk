@@ -1,4 +1,3 @@
-#include <android/dlext.h>
 #include <sys/mount.h>
 #include <dlfcn.h>
 #include <regex.h>
@@ -6,23 +5,26 @@
 #include <list>
 #include <map>
 #include <array>
+#include <vector>
 
 #include <lsplt.hpp>
 
 #include <fcntl.h>
+#include <dirent.h>
+#include <sys/types.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <unistd.h>
 
-#include "dl.h"
+#include <unistd.h>
+#include <pthread.h>
+
 #include "daemon.h"
 #include "zygisk.hpp"
 #include "module.hpp"
-#include "files.hpp"
-#include "misc.hpp"
+#include "misc.h"
 
-#include "solist.hpp"
+#include "solist.h"
 
 #include "art_method.hpp"
 
@@ -96,6 +98,7 @@ struct ZygiskContext {
     ~ZygiskContext();
 
     /* Zygisksu changed: Load module fds */
+    bool load_modules_only();
     void run_modules_pre();
     void run_modules_post();
     DCL_PRE_POST(fork)
@@ -120,7 +123,7 @@ struct ZygiskContext {
 
 // Global variables
 vector<tuple<dev_t, ino_t, const char *, void **>> *plt_hook_list;
-map<string, vector<JNINativeMethod>, StringCmp> *jni_hook_list;
+map<string, vector<JNINativeMethod>> *jni_hook_list;
 bool should_unmap_zygisk = false;
 std::vector<lsplt::MapInfo> cached_map_infos = {};
 
@@ -137,6 +140,41 @@ DCL_HOOK_FUNC(int, fork) {
     return (g_ctx && g_ctx->pid >= 0) ? g_ctx->pid : old_fork();
 }
 
+bool update_mnt_ns(enum mount_namespace_state mns_state, bool dry_run) {
+    char ns_path[PATH_MAX];
+    if (rezygiskd_update_mns(mns_state, ns_path, sizeof(ns_path)) == false) {
+        PLOGE("Failed to update mount namespace");
+
+        return false;
+    }
+
+    if (dry_run) return true;
+
+    int updated_ns = open(ns_path, O_RDONLY);
+    if (updated_ns == -1) {
+        PLOGE("Failed to open mount namespace [%s]", ns_path);
+
+        return false;
+    }
+
+    const char *mns_state_str = NULL;
+    if (mns_state == Clean) mns_state_str = "clean";
+    else if (mns_state == Mounted) mns_state_str = "mounted";
+    else mns_state_str = "unknown";
+
+    LOGD("set mount namespace to [%s] fd=[%d]: %s", ns_path, updated_ns, mns_state_str);
+    if (setns(updated_ns, CLONE_NEWNS) == -1) {
+        PLOGE("Failed to set mount namespace [%s]", ns_path);
+        close(updated_ns);
+
+        return false;
+    }
+
+    close(updated_ns);
+
+    return true;
+}
+
 // Unmount stuffs in the process's private mount namespace
 DCL_HOOK_FUNC(int, unshare, int flags) {
     int res = old_unshare(flags);
@@ -144,35 +182,31 @@ DCL_HOOK_FUNC(int, unshare, int flags) {
         // For some unknown reason, unmounting app_process in SysUI can break.
         // This is reproducible on the official AVD running API 26 and 27.
         // Simply avoid doing any unmounts for SysUI to avoid potential issues.
-        (g_ctx->info_flags & PROCESS_IS_SYS_UI) == 0) {
-        if (g_ctx->flags[DO_REVERT_UNMOUNT]) {
-            if (g_ctx->info_flags & PROCESS_ROOT_IS_KSU) {
-                revert_unmount_ksu();
-            } else if (g_ctx->info_flags & PROCESS_ROOT_IS_APATCH){
-                revert_unmount_apatch();
-            } else if (g_ctx->info_flags & PROCESS_ROOT_IS_MAGISK) {
-                revert_unmount_magisk();
-            }
+        !g_ctx->flags[SERVER_FORK_AND_SPECIALIZE] && !(g_ctx->info_flags & PROCESS_IS_FIRST_STARTED)) {
+
+        /* INFO: There might be cases, specifically in Magisk, where the app is in
+                   DenyList but also has root privileges. For those, it is up to the
+                   user remove it, and the weird behavior is expected, as the weird
+                   user behavior. */
+
+        /* INFO: For cases like Magisk, where you can only give an app SU if it was
+                   either requested before or if it's not in DenyList, we cannot
+                   umount it, or else it will not be (easily) possible to give new
+                   apps SU. Apps that are not marked in APatch/KernelSU to be umounted
+                   are also expected to have AP/KSU mounts there, so we will follow the
+                   same idea by not umounting any mount. */
+
+        if (g_ctx->info_flags & (PROCESS_IS_MANAGER | PROCESS_GRANTED_ROOT) || !(g_ctx->flags[DO_REVERT_UNMOUNT])) {
+            update_mnt_ns(Mounted, false);
         }
 
-        /* Zygisksu changed: No umount app_process */
-
-        // Restore errno back to 0
-        errno = 0;
+        old_unshare(CLONE_NEWNS);
     }
+
+    /* INFO: To spoof the errno value */
+    errno = 0;
+
     return res;
-}
-
-// Close logd_fd if necessary to prevent crashing
-// For more info, check comments in zygisk_log_write
-DCL_HOOK_FUNC(void, android_log_close) {
-    if (g_ctx == nullptr) {
-        // Happens during un-managed fork like nativeForkApp, nativeForkUsap
-        logging::setfd(-1);
-    } else if (!g_ctx->flags[SKIP_FD_SANITIZATION]) {
-        logging::setfd(-1);
-    }
-    old_android_log_close();
 }
 
 // We cannot directly call `dlclose` to unload ourselves, otherwise when `dlclose` returns,
@@ -189,11 +223,13 @@ DCL_HOOK_FUNC(int, pthread_attr_setstacksize, void *target, size_t size) {
     if (should_unmap_zygisk) {
         unhook_functions();
         cached_map_infos.clear();
+
         if (should_unmap_zygisk) {
             // Because both `pthread_attr_setstacksize` and `dlclose` have the same function signature,
             // we can use `musttail` to let the compiler reuse our stack frame and thus
             // `dlclose` will directly return to the caller of `pthread_attr_setstacksize`.
-            LOGI("unmap libzygisk.so loaded at %p with size %zu", start_addr, block_size);
+            LOGD("unmap libzygisk.so loaded at %p with size %zu", start_addr, block_size);
+
             [[clang::musttail]] return munmap(start_addr, block_size);
         }
     }
@@ -371,8 +407,9 @@ void ZygiskContext::plt_hook_register(const char *regex, const char *symbol, voi
     regex_t re;
     if (regcomp(&re, regex, REG_NOSUB) != 0)
         return;
-    mutex_guard lock(hook_info_lock);
+    pthread_mutex_lock(&hook_info_lock);
     register_info.emplace_back(RegisterInfo{re, symbol, fn, backup});
+    pthread_mutex_unlock(&hook_info_lock);
 }
 
 void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
@@ -380,8 +417,9 @@ void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
     regex_t re;
     if (regcomp(&re, regex, REG_NOSUB) != 0)
         return;
-    mutex_guard lock(hook_info_lock);
+    pthread_mutex_lock(&hook_info_lock);
     ignore_info.emplace_back(IgnoreInfo{re, symbol ?: ""});
+    pthread_mutex_unlock(&hook_info_lock);
 }
 
 void ZygiskContext::plt_hook_process_regex() {
@@ -410,11 +448,13 @@ void ZygiskContext::plt_hook_process_regex() {
 
 bool ZygiskContext::plt_hook_commit() {
     {
-        mutex_guard lock(hook_info_lock);
+        pthread_mutex_lock(&hook_info_lock);
         plt_hook_process_regex();
         register_info.clear();
         ignore_info.clear();
+        pthread_mutex_unlock(&hook_info_lock);
     }
+
     return lsplt::CommitHook(cached_map_infos);
 }
 
@@ -436,12 +476,12 @@ bool ZygiskModule::valid() const {
 
 /* Zygisksu changed: Use own zygiskd */
 int ZygiskModule::connectCompanion() const {
-    return zygiskd::ConnectCompanion(id);
+    return rezygiskd_connect_companion(id);
 }
 
 /* Zygisksu changed: Use own zygiskd */
 int ZygiskModule::getModuleDir() const {
-    return zygiskd::GetModuleDir(id);
+    return rezygiskd_get_module_dir(id);
 }
 
 void ZygiskModule::setOption(zygisk::Option opt) {
@@ -471,25 +511,38 @@ int sigmask(int how, int signum) {
 }
 
 void ZygiskContext::fork_pre() {
-    // Do our own fork before loading any 3rd party code
-    // First block SIGCHLD, unblock after original fork is done
+    /* INFO: Do our own fork before loading any 3rd party code.
+             First block SIGCHLD, unblock after original fork is done.
+    */
     sigmask(SIG_BLOCK, SIGCHLD);
     pid = old_fork();
     if (pid != 0 || flags[SKIP_FD_SANITIZATION])
         return;
 
-    // Record all open fds
-    auto dir = xopen_dir("/proc/self/fd");
-    for (dirent *entry; (entry = readdir(dir.get()));) {
+    /* INFO: Record all open fds */
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        PLOGE("Failed to open /proc/self/fd");
+
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
         int fd = parse_int(entry->d_name);
         if (fd < 0 || fd >= MAX_FD_SIZE) {
             close(fd);
+
             continue;
         }
+
         allowed_fds[fd] = true;
     }
-    // The dirfd should not be allowed
-    allowed_fds[dirfd(dir.get())] = false;
+
+    /* INFO: The dirfd should not be allowed */
+    allowed_fds[dirfd(dir)] = false;
+
+    closedir(dir);
 }
 
 void ZygiskContext::sanitize_fds() {
@@ -538,14 +591,25 @@ void ZygiskContext::sanitize_fds() {
         return;
 
     // Close all forbidden fds to prevent crashing
-    auto dir = open_dir("/proc/self/fd");
-    int dfd = dirfd(dir.get());
-    for (dirent *entry; (entry = readdir(dir.get()));) {
-        int fd = parse_int(entry->d_name);
-        if ((fd < 0 || fd >= MAX_FD_SIZE || !allowed_fds[fd]) && fd != dfd) {
-            close(fd);
-        }
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        PLOGE("Failed to open /proc/self/fd");
+
+        return;
     }
+
+    int dfd = dirfd(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        int fd = parse_int(entry->d_name);
+        if (fd < 0 || fd > MAX_FD_SIZE || fd == dfd || allowed_fds[fd]) continue;
+
+        close(fd);
+
+        LOGW("Closed leaked fd: %d", fd);
+    }
+
+    closedir(dir);
 }
 
 void ZygiskContext::fork_post() {
@@ -554,26 +618,49 @@ void ZygiskContext::fork_post() {
     g_ctx = nullptr;
 }
 
-/* Zygisksu changed: Load module fds */
-void ZygiskContext::run_modules_pre() {
-    auto ms = zygiskd::ReadModules();
-    auto size = ms.size();
-    for (size_t i = 0; i < size; i++) {
-        auto& m = ms[i];
-        if (void* handle = DlopenMem(m.memfd, RTLD_NOW);
-            void* entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr) {
-            modules.emplace_back(i, handle, entry);
-        }
+bool ZygiskContext::load_modules_only() {
+  struct zygisk_modules ms;
+  if (rezygiskd_read_modules(&ms) == false) {
+    LOGE("Failed to read modules from zygiskd");
+
+    return false;
+  }
+
+  for (size_t i = 0; i < ms.modules_count; i++) {
+    char *lib_path = ms.modules[i];
+
+    void *handle = dlopen(lib_path, RTLD_NOW);
+    if (!handle) {
+      LOGE("Failed to load module [%s]: %s", lib_path, dlerror());
+
+      continue;
     }
 
-    for (auto &m : modules) {
-        m.onLoad(env);
-        if (flags[APP_SPECIALIZE]) {
-            m.preAppSpecialize(args.app);
-        } else if (flags[SERVER_FORK_AND_SPECIALIZE]) {
-            m.preServerSpecialize(args.server);
-        }
+    void *entry = dlsym(handle, "zygisk_module_entry");
+    if (!entry) {
+      LOGE("Failed to find entry point in module [%s]: %s", lib_path, dlerror());
+
+      dlclose(handle);
+
+      continue;
     }
+
+    modules.emplace_back(i, handle, entry);
+  }
+
+  free_modules(&ms);
+
+  return true;
+}
+
+/* Zygisksu changed: Load module fds */
+void ZygiskContext::run_modules_pre() {
+  for (auto &m : modules) {
+    m.onLoad(env);
+
+    if (flags[APP_SPECIALIZE]) m.preAppSpecialize(args.app);
+    else if (flags[SERVER_FORK_AND_SPECIALIZE]) m.preServerSpecialize(args.server);
+  }
 }
 
 void ZygiskContext::run_modules_post() {
@@ -581,11 +668,9 @@ void ZygiskContext::run_modules_post() {
 
     size_t modules_unloaded = 0;
     for (const auto &m : modules) {
-        if (flags[APP_SPECIALIZE]) {
-            m.postAppSpecialize(args.app);
-        } else if (flags[SERVER_FORK_AND_SPECIALIZE]) {
-            m.postServerSpecialize(args.server);
-        }
+        if (flags[APP_SPECIALIZE]) m.postAppSpecialize(args.app);
+        else if (flags[SERVER_FORK_AND_SPECIALIZE]) m.postServerSpecialize(args.server);
+
         if (m.tryUnload()) modules_unloaded++;
     }
 
@@ -598,17 +683,52 @@ void ZygiskContext::run_modules_post() {
 /* Zygisksu changed: Load module fds */
 void ZygiskContext::app_specialize_pre() {
     flags[APP_SPECIALIZE] = true;
-    info_flags = zygiskd::GetProcessFlags(g_ctx->args.app->uid);
 
-    if ((info_flags & PROCESS_ON_DENYLIST) == PROCESS_ON_DENYLIST) {
-      flags[DO_REVERT_UNMOUNT] = true;
+    info_flags = rezygiskd_get_process_flags(g_ctx->args.app->uid, (const char *const)process);
+     if (info_flags & PROCESS_IS_FIRST_STARTED) {
+        /* INFO: To ensure we are really using a clean mount namespace, we use
+                   the first process it as reference for clean mount namespace,
+                   before it even does something, so that it will be clean yet
+                   with expected mounts.
+        */
+        update_mnt_ns(Clean, true);
     }
 
     if ((info_flags & (PROCESS_IS_MANAGER | PROCESS_ROOT_IS_MAGISK)) == (PROCESS_IS_MANAGER | PROCESS_ROOT_IS_MAGISK)) {
-        LOGI("Manager process detected. Notifying that Zygisk has been enabled.");
+        LOGD("Manager process detected. Notifying that Zygisk has been enabled.");
 
+        /* INFO: This environment variable is related to Magisk Zygisk/Manager. It
+                   it used by Magisk's Zygisk to communicate to Magisk Manager whether
+                   Zygisk is working or not.
+
+                 To allow Zygisk modules to both work properly and for the manager to
+                   identify Zygisk, being it not built-in, as working, we also set it. */
         setenv("ZYGISK_ENABLED", "1", 1);
     } else {
+        /* INFO: Because we load directly from the file, we need to do it before we umount
+                   the mounts, or else it won't have access to /data/adb anymore.
+        */
+        if (!load_modules_only()) {
+            LOGE("Failed to load modules");
+
+            return;
+        }
+
+        /* INFO: Modules only have two "start off" points from Zygisk, preSpecialize and
+                   postSpecialize. While preSpecialie in fact runs with Zygote (not superuser)
+                   privileges, in postSpecialize it will now be with lower permission, in
+                   the app's sandbox and therefore can move to a clean mount namespace after
+                   executing the modules preSpecialize.
+        */
+        if ((info_flags & PROCESS_ON_DENYLIST) == PROCESS_ON_DENYLIST) {
+          flags[DO_REVERT_UNMOUNT] = true;
+
+          update_mnt_ns(Clean, false);
+        }
+
+        /* INFO: Executed after setns to ensure a module can update the mounts of an 
+                   application without worrying about it being overwritten by setns.
+        */
         run_modules_pre();
     }
 }
@@ -620,7 +740,6 @@ void ZygiskContext::app_specialize_post() {
     // Cleanups
     env->ReleaseStringUTFChars(args.app->nice_name, process);
     g_ctx = nullptr;
-    logging::setfd(-1);
 }
 
 bool ZygiskContext::exempt_fd(int fd) {
@@ -653,11 +772,12 @@ void ZygiskContext::nativeForkSystemServer_pre() {
     flags[SERVER_FORK_AND_SPECIALIZE] = true;
 
     fork_pre();
-    if (pid != 0)
-        return;
+    if (!is_child())
+      return;
 
+    load_modules_only();
     run_modules_pre();
-    zygiskd::SystemServerStarted();
+    rezygiskd_system_server_started();
 
     sanitize_fds();
 }
@@ -673,17 +793,12 @@ void ZygiskContext::nativeForkSystemServer_post() {
 void ZygiskContext::nativeForkAndSpecialize_pre() {
     process = env->GetStringUTFChars(args.app->nice_name, nullptr);
     LOGV("pre forkAndSpecialize [%s]", process);
-
     flags[APP_FORK_AND_SPECIALIZE] = true;
-    /* Zygisksu changed: No args.app->fds_to_ignore check since we are Android 10+ */
-    if (logging::getfd() != -1) {
-        exempted_fds.push_back(logging::getfd());
-    }
 
     fork_pre();
-    if (pid == 0) {
+    if (pid == 0)
         app_specialize_pre();
-    }
+
     sanitize_fds();
 }
 
@@ -754,8 +869,11 @@ static void hook_register(dev_t dev, ino_t inode, const char *symbol, void *new_
 void clean_trace(const char* path, size_t load, size_t unload, bool spoof_maps) {
     LOGD("cleaning trace for path %s", path);
 
-    if (load > 0 || unload >0) SoList::ResetCounters(load, unload);
-    bool path_found = SoList::DropSoPath(path);
+    if (load > 0 || unload > 0) solist_reset_counters(load, unload);
+
+    LOGD("Dropping solist record for %s", path);
+
+    bool path_found = solist_drop_so_path(path);
     if (!path_found || !spoof_maps) return;
 
     LOGD("spoofing virtual maps for %s", path);
@@ -783,14 +901,11 @@ void clean_trace(const char* path, size_t load, size_t unload, bool spoof_maps) 
 }
 
 void hook_functions() {
-    default_new(plt_hook_list);
-    default_new(jni_hook_list);
+    plt_hook_list = new vector<tuple<dev_t, ino_t, const char *, void **>>();
+    jni_hook_list = new map<string, vector<JNINativeMethod>>();
 
     ino_t android_runtime_inode = 0;
     dev_t android_runtime_dev = 0;
-    /* TODO by ThePedroo: Implement injection via native bridge */
-    // ino_t native_bridge_inode = 0;
-    // dev_t native_bridge_dev = 0;
 
     cached_map_infos = lsplt::MapInfo::Scan();
     for (auto &map : cached_map_infos) {
@@ -805,7 +920,6 @@ void hook_functions() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
-    PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close", android_log_close);
     hook_commit();
 
     // Remove unhooked methods

@@ -1,6 +1,9 @@
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
 
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include "../utils.h"
 #include "kernelsu.h"
@@ -91,7 +94,7 @@ bool uid_granted_root(uid_t uid) {
   }
 }
 
-bool uid_should_umount(uid_t uid) {
+bool uid_should_umount(uid_t uid, const char *const process) {
   switch (impl.impl) {
     case KernelSU: {
       return ksu_uid_should_umount(uid);
@@ -100,7 +103,7 @@ bool uid_should_umount(uid_t uid) {
       return apatch_uid_should_umount(uid);
     }
     case Magisk: {
-      return magisk_uid_should_umount(uid);
+      return magisk_uid_should_umount(process);
     }
     default: {
       return false;
